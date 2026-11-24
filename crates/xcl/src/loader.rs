@@ -346,6 +346,7 @@ pub fn run_main(m: &Arc<MappedModule>) -> u32 {
         } else {
             *(peb().add(0x10) as *mut usize) = m.base;
         }
+        crate::title_patches::apply(m);
         run_tls_callbacks(m, 1);
     }
     READY.store(true, Ordering::Release);
