@@ -80,6 +80,26 @@ pub fn counts() -> (usize, u64) {
     (TEXTURES.lock().unwrap().len(), UPLOADS.load(Ordering::Relaxed))
 }
 
+/// (textures kept in step, bytes of their console layouts, bytes of title memory they cover)
+/// – `XCL_ACTIVITY`
+pub fn bytes() -> (usize, u64, u64) {
+    let mut spans: Vec<(usize, usize)> = {
+        let t = TEXTURES.lock().unwrap();
+        t.values().filter(|e| e.tex.size() != u64::MAX).map(|e| (e.va, e.va + e.tex.size() as usize)).collect()
+    };
+    let sum = spans.iter().map(|&(a, b)| (b - a) as u64).sum();
+    spans.sort_unstable();
+    let (mut covered, mut end) = (0u64, 0usize);
+    for (a, b) in spans.iter().copied() {
+        let a = a.max(end);
+        if b > a {
+            covered += (b - a) as u64;
+            end = b;
+        }
+    }
+    (spans.len(), sum, covered)
+}
+
 /// A texture the title placed at `va` (its console desc `desc`): kept in step with the memory.
 pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, desc: &[u8; 0x38], state: D3D12_RESOURCE_STATES) -> Result<(), String> {
     let tex = xg::Texture::new(desc).map_err(|hr| format!("layout {hr:#x}"))?;
@@ -119,6 +139,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
     let e = Entry { device: device as usize, va, tex: Arc::new(tex), states: vec![state], pending: true, gpu_written: false };
     {
         let mut t = TEXTURES.lock().unwrap();
+        trace_overlap(&t, va, e.tex.size(), desc);
         if let Some(old) = t.insert(res as usize, e) {
             if old.pending {
                 PENDING.fetch_sub(1, Ordering::Relaxed);
@@ -129,6 +150,42 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
     }
     TEXTURES_GEN.fetch_add(1, Ordering::Release);
     Ok(())
+}
+
+/// `XCL_TRACE_TEX_OVERLAP`: textures placed over the memory of textures still alive (the first
+/// 40, then one in 256).
+fn trace_overlap(t: &BTreeMap<usize, Entry>, va: usize, size: u64, desc: &[u8; 0x38]) {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("XCL_TRACE_TEX_OVERLAP").is_some());
+    static N: AtomicU64 = AtomicU64::new(0);
+    if !*ON || size == u64::MAX {
+        return;
+    }
+    let end = va + size as usize;
+    let olds: Vec<String> = t
+        .values()
+        .filter(|o| o.tex.size() != u64::MAX && o.va < end && va < o.va + o.tex.size() as usize)
+        .take(6)
+        .map(|o| format!("{:#x}+{:#x}{}{}", o.va, o.tex.size(), if o.pending { " pending" } else { "" }, if o.gpu_written { " gpu-written" } else { "" }))
+        .collect();
+    if olds.is_empty() {
+        return;
+    }
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n >= 40 && n % 256 != 0 {
+        return;
+    }
+    let u = |o: usize| u32::from_le_bytes(desc[o..o + 4].try_into().unwrap());
+    crate::xlog_info!(
+        "title texture {va:#x}+{size:#x} ({}x{}x{}, {} mips, format {}, layout {:#x}, flags {:#x}) over live ones: {}",
+        u64::from_le_bytes(desc[0x10..0x18].try_into().unwrap()),
+        u(0x18),
+        u16::from_le_bytes(desc[0x1C..0x1E].try_into().unwrap()),
+        u16::from_le_bytes(desc[0x1E..0x20].try_into().unwrap()),
+        u(0x20),
+        u(0x2C),
+        u(0x30),
+        olds.join(", ")
+    );
 }
 
 /// The title's GPU work writes texture `res` (a copy into it): on the console the memory then

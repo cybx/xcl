@@ -2066,17 +2066,41 @@ fn cube_as_cube_array(v: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> Option<D3D12_SHADE
 
 /// The texture a view by address describes: `desc` (a resource desc) placed at `va`, made once
 /// per address and desc – titles make views of the same memory again and again.
+///
+/// These textures are ours: the title never releases them. A title that streams textures
+/// reuses its memory for others all the time (a retail game: 30,000 textures made over 2.5 GB
+/// of memory in two minutes of loading, until the PC's video memory and commit ran out and it
+/// crashed), so a texture made over memory that others made here cover retires them: the
+/// memory holds the new one now. Retired textures are released some seconds later, when work
+/// the title submitted with their views has finished. Textures over exactly the same memory
+/// (the views of one texture in other formats or shapes) stay.
 unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_void {
-    type Key = (u64, [u8; 0x38]);
-    static MADE: Mutex<Option<HashMap<Key, usize>>> = Mutex::new(None);
+    /// (address, PC desc) → (resource, end of its console memory)
+    type Made = std::collections::BTreeMap<(u64, [u8; 0x38]), (usize, u64)>;
+    static MADE: Mutex<Made> = Mutex::new(std::collections::BTreeMap::new());
+    /// the longest span in `MADE` (overlap searches start that far below an address)
+    static LONGEST: AtomicU64 = AtomicU64::new(0);
+    /// (resource, when it was retired)
+    static RETIRED: Mutex<Vec<(usize, std::time::Instant)>> = Mutex::new(Vec::new());
+    const RETIRE_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
     if desc.is_null() || va == 0 || !crate::gpu::shader::readable(desc as usize, 0x38) {
         return std::ptr::null_mut();
     }
     // the PC part of the desc; the flags (@0x30) are its last dword, padding follows
     let mut x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
     x[0x34..].fill(0);
-    if let Some(&r) = MADE.lock().unwrap().get_or_insert_with(HashMap::new).get(&(va, x)) {
+    if let Some(&(r, _)) = MADE.lock().unwrap().get(&(va, x)) {
         return r as *mut c_void;
+    }
+    // release what retired long enough ago (outside the lock: Release reaches `res_release`)
+    let due: Vec<usize> = {
+        let mut g = RETIRED.lock().unwrap();
+        let now = std::time::Instant::now();
+        let n = g.iter().take_while(|(_, at)| now.duration_since(*at) >= RETIRE_AFTER).count();
+        g.drain(..n).map(|(r, _)| r).collect()
+    };
+    for r in due {
+        drop(ID3D12Resource::from_raw(r as *mut c_void));
     }
     let mut r = std::ptr::null_mut();
     let hr = super::device_x::create_placed_resource_x(this, va, x.as_ptr(), 0, std::ptr::null(), &ID3D12Resource::IID as *const _ as *const GUID, &mut r);
@@ -2087,8 +2111,43 @@ unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_voi
         }
         r = std::ptr::null_mut();
     }
-    MADE.lock().unwrap().get_or_insert_with(HashMap::new).insert((va, x), r as usize);
+    let size = crate::hle::xg::Texture::new(&x).map_or(0, |t| t.size());
+    let end = if r.is_null() || size == u64::MAX { va } else { va + size };
+    let retired: Vec<usize> = {
+        let mut m = MADE.lock().unwrap();
+        let longest = LONGEST.fetch_max(end - va, Ordering::Relaxed).max(end - va);
+        let stale: Vec<(u64, [u8; 0x38])> = if end > va {
+            m.range((va.saturating_sub(longest), [0; 0x38])..(end, [0; 0x38]))
+                .filter(|(&(a, _), &(_, e))| e > va && a < end && !(a == va && e == end))
+                .map(|(k, _)| *k)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut retired: Vec<usize> = stale.iter().filter_map(|k| m.remove(k)).map(|(r, _)| r).filter(|&r| r != 0).collect();
+        // (another thread made the same one meanwhile)
+        if let Some((o, _)) = m.insert((va, x), (r as usize, end)).filter(|&(o, _)| o != 0 && o != r as usize) {
+            retired.push(o);
+        }
+        retired
+    };
+    if !retired.is_empty() {
+        note_retired(retired.len());
+        let now = std::time::Instant::now();
+        RETIRED.lock().unwrap().extend(retired.into_iter().map(|r| (r, now)));
+    }
     r
+}
+
+/// Textures made for views by address and retired because others were made over their memory
+/// (logged at powers of two).
+fn note_retired(n: usize) {
+    static TOTAL: AtomicU64 = AtomicU64::new(0);
+    let before = TOTAL.fetch_add(n as u64, Ordering::Relaxed);
+    let after = before + n as u64;
+    if after.ilog2() != before.max(1).ilog2() && after >= 16 {
+        crate::xlog_info!("D3D12.X: {after} textures of views by address retired (their memory holds other textures now)");
+    }
 }
 
 /// device #70 (a retail game): a shader resource view of memory, without a resource object:
@@ -2106,7 +2165,73 @@ unsafe extern "system" fn dev_create_srv_at_x(this: *mut c_void, rdesc: *const u
         let words = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw);
         return super::console_heap::write(&slot, &words);
     }
+    // a streamed texture: the view starts at mip k, the memory holds mips k.. only
+    if let Some((x, tv)) = resident_mips(rdesc, &v) {
+        let r = resource_at(this, x.as_ptr(), va);
+        if !r.is_null() {
+            return dev_create_srv_x(this, r, &tv, cpu);
+        }
+    }
     dev_create_srv_x(this, resource_at(this, rdesc, va), &v, cpu);
+}
+
+/// A 2D view whose most detailed mip `k` is not the resource's first: the resource made of
+/// mips k.. only, and the view of all of it. The console lays a mip chain out smallest level
+/// first (the tail, then each larger level after it, mip 0 last), so mip k of the chain and
+/// mip 0 of a chain `k` levels shorter sit at the same address in the same layout. A title
+/// that streams textures (a retail game: 27,000 of them over 2.3 GB of memory) places each at
+/// the memory of the mips it has loaded; the levels above them overlap its neighbours. A PC
+/// texture of the whole chain cost video memory and commit for all of those levels: 6 GB of
+/// textures for 2.3 GB of memory, until both ran out and the title crashed. `XCL_TRIM_MIPS=0`
+/// turns this off.
+unsafe fn resident_mips(rdesc: *const u8, v: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> Option<([u8; 0x38], D3D12_SHADER_RESOURCE_VIEW_DESC)> {
+    static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("XCL_TRIM_MIPS").is_ok_and(|v| v.trim() == "0"));
+    if *OFF || v.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D || rdesc.is_null() || !crate::gpu::shader::readable(rdesc as usize, 0x38) {
+        return None;
+    }
+    let t = v.Anonymous.Texture2D;
+    let k = t.MostDetailedMip;
+    let mut x: [u8; 0x38] = (rdesc as *const [u8; 0x38]).read_unaligned();
+    let dim = u32::from_le_bytes(x[0..4].try_into().unwrap());
+    let width = u64::from_le_bytes(x[0x10..0x18].try_into().unwrap());
+    let height = u32::from_le_bytes(x[0x18..0x1C].try_into().unwrap());
+    let array = u16::from_le_bytes(x[0x1C..0x1E].try_into().unwrap());
+    let mips = u16::from_le_bytes(x[0x1E..0x20].try_into().unwrap()) as u32;
+    let samples = u32::from_le_bytes(x[0x24..0x28].try_into().unwrap());
+    // (2D, one slice: an array's slices are whole chains apart; mips 0: the full chain)
+    if k == 0 || dim != D3D12_RESOURCE_DIMENSION_TEXTURE2D.0 as u32 || array != 1 || samples > 1 || mips == 0 || k >= mips {
+        return None;
+    }
+    let (w, h) = ((width >> k).max(1), (height >> k).max(1));
+    // a block-compressed PC texture's top level is whole blocks (DXGI BC1..BC5, BC6H, BC7)
+    let format = u32::from_le_bytes(x[0x20..0x24].try_into().unwrap());
+    if matches!(format, 70..=84 | 94..=99) && (w % 4 != 0 || h % 4 != 0) {
+        return None;
+    }
+    x[0x10..0x18].copy_from_slice(&w.to_le_bytes());
+    x[0x18..0x1C].copy_from_slice(&h.to_le_bytes());
+    x[0x1E..0x20].copy_from_slice(&((mips - k) as u16).to_le_bytes());
+    let mut tv = *v;
+    tv.Anonymous.Texture2D = D3D12_TEX2D_SRV {
+        MostDetailedMip: 0,
+        MipLevels: t.MipLevels,
+        PlaneSlice: t.PlaneSlice,
+        ResourceMinLODClamp: (t.ResourceMinLODClamp - k as f32).max(0.0),
+    };
+    note_trimmed(k);
+    Some((x, tv))
+}
+
+/// Views made of the resident mips only, by first mip (logged at powers of two).
+fn note_trimmed(k: u32) {
+    static BY_MIP: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+    BY_MIP[(k as usize).min(15)].fetch_add(1, Ordering::Relaxed);
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() && n >= 16 {
+        let by: Vec<u64> = BY_MIP.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        crate::xlog_info!("D3D12.X: {n} views at an address made of the mips they show (by first mip: {by:?})");
+    }
 }
 
 /// device #71: the same for an unordered access view ({ the PC's UAV desc; GPU address @0x28;

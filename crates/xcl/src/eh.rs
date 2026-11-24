@@ -74,7 +74,8 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
                 8 => "execute",
                 _ => "?",
             };
-            extra = format!(" ({op} at address {:#x})", rec.ExceptionInformation[1]);
+            let at = rec.ExceptionInformation[1];
+            extra = format!(" ({op} at address {at:#x}{})", page_state(at));
         }
         if rec.ExceptionCode as u32 == ILLEGAL_INSTRUCTION {
             extra = format!(" (code bytes: {})", code_at(addr));
@@ -116,6 +117,28 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
         0 => 0, // EXCEPTION_CONTINUE_SEARCH
         f => std::mem::transmute::<usize, unsafe extern "system" fn(*const EXCEPTION_POINTERS) -> i32>(f)(info),
     }
+}
+
+/// What the memory at `p` is (VirtualQuery; in unified memory, a sparse window of it) – an
+/// access violation's address.
+fn page_state(p: usize) -> String {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION};
+    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: VirtualQuery only reads the address space's bookkeeping
+    if unsafe { VirtualQuery(p as *const c_void, &mut m, std::mem::size_of_val(&m)) } == 0 {
+        return String::new();
+    }
+    let state = match m.State {
+        0x1000 => "committed",
+        0x2000 => "reserved",
+        0x10000 => "free",
+        _ => "?",
+    };
+    let uma = crate::gpu::uma::get().filter(|u| u.contains(p)).map_or("", |u| if u.is_sparse(p) { ", unified memory (sparse window)" } else { ", unified memory" });
+    format!(
+        "; {state}, protect {:#x}, type {:#x}, region {:#x}+{:#x} of allocation {:#x}{uma}",
+        m.Protect, m.Type, m.BaseAddress as usize, m.RegionSize, m.AllocationBase as usize
+    )
 }
 
 static ORIG_NT_TERMINATE: AtomicUsize = AtomicUsize::new(0);
